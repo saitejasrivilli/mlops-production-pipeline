@@ -1,0 +1,195 @@
+name: ML Pipeline CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * 1'   # Weekly retraining every Monday at 2 AM UTC
+  workflow_dispatch:
+    inputs:
+      run_name:
+        description: 'MLflow run name'
+        required: false
+        default: 'manual_run'
+      threshold:
+        description: 'Accuracy threshold for registration'
+        required: false
+        default: '0.90'
+
+env:
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI || 'http://localhost:5000' }}
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  lint-and-test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest ruff
+
+      - name: Lint with ruff
+        run: ruff check . --ignore E501
+
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short
+
+  train:
+    name: Train Model
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    outputs:
+      run_id: ${{ steps.train_step.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run training
+        id: train_step
+        run: |
+          RUN_NAME="${{ github.event.inputs.run_name || format('ci_run_{0}', github.sha) }}"
+          python pipeline/train.py \
+            --run_name "$RUN_NAME" \
+            --num_epochs 1 \
+            --max_samples 500
+          echo "run_id=$(cat last_run_id.txt)" >> $GITHUB_OUTPUT
+
+      - name: Upload run ID artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: run_id
+          path: last_run_id.txt
+
+  evaluate:
+    name: Evaluate Model
+    runs-on: ubuntu-latest
+    needs: train
+    outputs:
+      accuracy: ${{ steps.eval_step.outputs.accuracy }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download run ID
+        uses: actions/download-artifact@v4
+        with:
+          name: run_id
+
+      - name: Run evaluation
+        id: eval_step
+        run: |
+          python pipeline/evaluate.py \
+            --run_id ${{ needs.train.outputs.run_id }} \
+            --max_samples 300
+          # Parse accuracy from MLflow
+          ACCURACY=$(python -c "
+          import mlflow
+          run = mlflow.get_run('${{ needs.train.outputs.run_id }}')
+          print(run.data.metrics.get('eval_accuracy', 0))
+          ")
+          echo "accuracy=$ACCURACY" >> $GITHUB_OUTPUT
+          echo "Accuracy: $ACCURACY"
+
+  register:
+    name: Register if Better
+    runs-on: ubuntu-latest
+    needs: [train, evaluate]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Register model if accuracy threshold met
+        run: |
+          THRESHOLD="${{ github.event.inputs.threshold || '0.90' }}"
+          python pipeline/register.py \
+            --run_id ${{ needs.train.outputs.run_id }} \
+            --threshold $THRESHOLD \
+            --stage Staging
+        continue-on-error: true
+
+  drift-check:
+    name: Drift Detection
+    runs-on: ubuntu-latest
+    needs: evaluate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run drift detection
+        run: python monitoring/drift_detector.py --demo
+
+      - name: Run alerting check
+        run: |
+          python -c "
+          from monitoring.alerts import AlertManager
+          manager = AlertManager(dry_run=True)
+          metrics = {
+            'eval_accuracy': float('${{ needs.evaluate.outputs.accuracy }}' or 0),
+            'psi': 0.05  # placeholder for demo
+          }
+          fired = manager.check(metrics)
+          for a in fired:
+            print(a['message'])
+          print(manager.summary())
+          "
+
+  notify:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: [train, evaluate, register, drift-check]
+    if: failure()
+    steps:
+      - name: Notify Slack on pipeline failure
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-type: application/json' \
+            --data '{"text":":red_circle: ML Pipeline FAILED on branch ${{ github.ref }} (commit ${{ github.sha }}).\nSee: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
