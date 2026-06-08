@@ -1,0 +1,54 @@
+model:
+  name: distilbert-base-uncased
+  num_labels: 2
+  max_length: 128
+
+training:
+  dataset: sst2
+  num_epochs: 3
+  batch_size: 16
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.06
+  max_train_samples: 5000
+  max_eval_samples: 872
+  output_dir: models/
+
+mlflow:
+  experiment_name: ml-pipeline-demo
+  tracking_uri: http://localhost:5000
+  registered_model_name: text-classifier
+  artifact_location: mlruns/
+
+registry:
+  promotion_stage: Staging
+  production_stage: Production
+  accuracy_threshold: 0.90
+  comparison_metric: eval_accuracy
+
+serving:
+  port: 3000
+  workers: 2
+  timeout_seconds: 30
+  max_batch_size: 64
+
+monitoring:
+  drift:
+    psi_threshold: 0.20
+    psi_warning_threshold: 0.10
+    cusum_slack: 0.02
+    cusum_threshold: 5.0
+    n_bins: 10
+    check_interval_hours: 24
+
+  alerts:
+    accuracy_critical_threshold: 0.85
+    accuracy_warning_threshold: 0.88
+    latency_p99_warning_ms: 500.0
+    cooldown_seconds: 3600
+    slack_webhook_env_var: SLACK_WEBHOOK_URL
+
+  retraining:
+    auto_trigger_on_concept_drift: true
+    auto_trigger_on_data_drift: true
+    max_retrain_frequency_hours: 168   # weekly cap
